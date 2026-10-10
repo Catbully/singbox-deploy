@@ -49,14 +49,42 @@ check_root
 # 安装依赖
 install_deps() {
     info "安装系统依赖..."
-    
+
     case "$OS" in
         alpine)
-            apk update || { err "apk update 失败"; exit 1; }
-            apk add --no-cache bash curl ca-certificates openssl openrc jq || {
-                err "依赖安装失败"
-                exit 1
-            }
+            local package missing_packages="" deps_service_manager=""
+
+            for package in bash curl ca-certificates openssl openrc jq; do
+                apk info -e "$package" >/dev/null 2>&1 || missing_packages="$missing_packages $package"
+            done
+
+            if [ -z "$missing_packages" ]; then
+                info "系统依赖均已安装，跳过 apk"
+                return 0
+            fi
+
+            if command -v rc-service >/dev/null 2>&1 \
+               && rc-service sing-box status >/dev/null 2>&1; then
+                info "停止现有 sing-box 服务，释放依赖安装所需内存..."
+                rc-service sing-box stop >/dev/null || {
+                    err "无法停止现有 sing-box 服务"
+                    exit 1
+                }
+                deps_service_manager="openrc"
+            fi
+
+            for package in $missing_packages; do
+                info "安装缺失依赖: $package"
+                if ! apk add --no-cache --no-progress "$package"; then
+                    [ "$deps_service_manager" = "openrc" ] \
+                        && rc-service sing-box start >/dev/null 2>&1 || true
+                    err "依赖安装失败: $package"
+                    exit 1
+                fi
+            done
+
+            [ "$deps_service_manager" = "openrc" ] \
+                && rc-service sing-box start >/dev/null 2>&1 || true
             ;;
         debian)
             export DEBIAN_FRONTEND=noninteractive
