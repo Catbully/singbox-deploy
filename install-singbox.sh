@@ -13,10 +13,18 @@ SINGBOX_BIN="/usr/local/bin/sing-box"
 SINGBOX_BIN_SRC="${SINGBOX_BIN_SRC:-/root/sing-box}"
 SINGBOX_TMP=""
 SINGBOX_STAGE=""
+SINGBOX_SERVICE_WAS_RUNNING="0"
 
 cleanup() {
     [ -z "$SINGBOX_STAGE" ] || rm -f -- "$SINGBOX_STAGE"
     [ -z "$SINGBOX_TMP" ] || rm -rf -- "$SINGBOX_TMP"
+    if [ "$SINGBOX_SERVICE_WAS_RUNNING" = "1" ]; then
+        if command -v rc-service >/dev/null 2>&1; then
+            rc-service sing-box status >/dev/null 2>&1 || rc-service sing-box start >/dev/null 2>&1 || true
+        elif command -v systemctl >/dev/null 2>&1; then
+            systemctl is-active --quiet sing-box || systemctl start sing-box >/dev/null 2>&1 || true
+        fi
+    fi
 }
 
 trap cleanup EXIT
@@ -161,6 +169,17 @@ install_singbox() {
             info "已取消安装，未修改配置和服务"
             exit 0
         fi
+    fi
+
+    # 重装时先释放旧 sing-box 进程占用的内存，避免 64 MiB 容器发生 OOM。
+    if command -v rc-service >/dev/null 2>&1 && rc-service sing-box status >/dev/null 2>&1; then
+        info "停止现有 sing-box 服务以释放安装内存..."
+        SINGBOX_SERVICE_WAS_RUNNING="1"
+        rc-service sing-box stop
+    elif command -v systemctl >/dev/null 2>&1 && systemctl is-active --quiet sing-box; then
+        info "停止现有 sing-box 服务以释放安装内存..."
+        SINGBOX_SERVICE_WAS_RUNNING="1"
+        systemctl stop sing-box
     fi
 
     machine=$(uname -m)
