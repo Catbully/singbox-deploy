@@ -58,4 +58,4 @@
 安装全功能 sing-box：
 
 ```bash
-bash -c "$(curl -fsSL https://raw.githubusercontent.com/Catbully/singbox-deploy/main/install-singbox.sh)"
+bash -c "$(curl -fsSL https://raw.githubusercontent.com/Catbully/singbox-deploy/main/install-singbox-yyds.sh)"
