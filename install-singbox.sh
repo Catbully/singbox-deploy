@@ -7,6 +7,20 @@ info() { echo -e "\033[1;34m[INFO]\033[0m $*"; }
 warn() { echo -e "\033[1;33m[WARN]\033[0m $*"; }
 err()  { echo -e "\033[1;31m[ERR]\033[0m $*" >&2; }
 
+# 固定官方版本与校验值，避免在低内存机器上调用包管理器或现场编译。
+SINGBOX_VERSION="1.14.2"
+SINGBOX_BIN="/usr/local/bin/sing-box"
+SINGBOX_TMP=""
+SINGBOX_STAGE=""
+
+cleanup() {
+    [ -z "$SINGBOX_STAGE" ] || rm -f -- "$SINGBOX_STAGE"
+    [ -z "$SINGBOX_TMP" ] || rm -rf -- "$SINGBOX_TMP"
+}
+
+trap cleanup EXIT
+trap 'exit 1' HUP INT TERM
+
 # -----------------------
 # 检测系统类型
 detect_os() {
@@ -88,6 +102,13 @@ install_deps() {
 
 install_deps
 
+for required_cmd in awk curl sha256sum tar; do
+    command -v "$required_cmd" >/dev/null 2>&1 || {
+        err "缺少安装所需命令: $required_cmd"
+        exit 1
+    }
+done
+
 # -----------------------
 # 端口和密码输入（支持环境变量）
 get_config() {
@@ -122,51 +143,99 @@ get_config() {
 get_config
 
 # -----------------------
-# 安装 sing-box
+# 安装官方 sing-box musl 二进制
 install_singbox() {
-    info "开始安装 sing-box..."
+    local machine arch expected archive_name archive_url archive_dir archive_path actual existing_bin
+
+    info "开始安装官方 sing-box v${SINGBOX_VERSION} musl 二进制..."
 
     # 检查是否已安装
-    if command -v sing-box >/dev/null 2>&1; then
-        CURRENT_VERSION=$(sing-box version 2>/dev/null | head -1 || echo "unknown")
+    if [ -x "$SINGBOX_BIN" ] || command -v sing-box >/dev/null 2>&1; then
+        existing_bin="$SINGBOX_BIN"
+        [ -x "$existing_bin" ] || existing_bin=$(command -v sing-box)
+        CURRENT_VERSION=$("$existing_bin" version 2>/dev/null | head -1 || echo "unknown")
         warn "检测到已安装 sing-box: $CURRENT_VERSION"
-        read -p "是否重新安装？(y/N): " REINSTALL
+        read -p "是否用官方 musl 二进制重新安装？(y/N): " REINSTALL
         if [[ ! "$REINSTALL" =~ ^[Yy]$ ]]; then
-            info "跳过 sing-box 安装"
-            return 0
+            info "已取消安装，未修改配置和服务"
+            exit 0
         fi
     fi
 
-    case "$OS" in
-        alpine)
-            info "使用 Edge 仓库安装 sing-box"
-            apk update || { err "apk update 失败"; exit 1; }
-            apk add --repository=http://dl-cdn.alpinelinux.org/alpine/edge/community sing-box || {
-                err "sing-box 安装失败"
-                exit 1
-            }
+    machine=$(uname -m)
+    case "$machine" in
+        x86_64|amd64)
+            arch="amd64"
+            expected="8f6cb4bcf94d2b33c65d52e0d5b142db29a938336f1ff7267f397ac3758fc297"
             ;;
-        debian|redhat)
-            # 原官方安装脚本
-            bash <(curl -fsSL https://sing-box.app/install.sh) || {
-                err "sing-box 安装失败"
-                err "请检查网络连接或手动安装"
-                exit 1
-            }
+        aarch64|arm64)
+            arch="arm64"
+            expected="675297394f9430cebb72b3c48ba8bce0d6f7c750a9d68a8f7f88c515c8255cd1"
+            ;;
+        i386|i486|i586|i686)
+            arch="386"
+            expected="e84faef6ccf47d9b7ffc071b1061b1dc8f38e747ce8f4d4543f200c2d1f6f845"
+            ;;
+        armv7|armv7l)
+            arch="armv7"
+            expected="ba873d9e1eaff53dd6f678ecc315ac6fcb9d28b32b550e1ecc8227634955b56f"
             ;;
         *)
-            err "未支持的系统，无法安装 sing-box"
+            err "暂不支持此 CPU 架构: $machine"
             exit 1
             ;;
     esac
 
-    # 验证安装
-    if ! command -v sing-box >/dev/null 2>&1; then
-        err "sing-box 安装后未找到可执行文件"
+    # 降低当前安装脚本和 SSH 守护进程被 OOM killer 优先终止的概率。
+    printf '%s\n' -1000 > "/proc/$$/oom_score_adj" 2>/dev/null || true
+    if command -v pgrep >/dev/null 2>&1; then
+        while IFS= read -r ssh_pid; do
+            [ -z "$ssh_pid" ] || printf '%s\n' -1000 > "/proc/${ssh_pid}/oom_score_adj" 2>/dev/null || true
+        done < <(pgrep -x sshd 2>/dev/null || true)
+    fi
+
+    # /tmp 在部分小内存 VPS 上是 tmpfs，使用 /var/tmp 避免压缩包占用 RAM。
+    SINGBOX_TMP=$(mktemp -d /var/tmp/singbox-musl.XXXXXX)
+    archive_name="sing-box-${SINGBOX_VERSION}-linux-${arch}-musl.tar.gz"
+    archive_url="https://github.com/SagerNet/sing-box/releases/download/v${SINGBOX_VERSION}/${archive_name}"
+    archive_dir="sing-box-${SINGBOX_VERSION}-linux-${arch}-musl"
+    archive_path="${SINGBOX_TMP}/${archive_name}"
+
+    info "下载 ${archive_name}..."
+    curl --fail --location --retry 3 --connect-timeout 15 \
+        --proto '=https' --tlsv1.2 \
+        --output "$archive_path" "$archive_url" || {
+        err "musl 二进制下载失败，请检查网络连接"
+        exit 1
+    }
+
+    actual=$(sha256sum "$archive_path" | awk '{print $1}')
+    if [ "$actual" != "$expected" ]; then
+        err "SHA-256 校验失败，已拒绝安装"
         exit 1
     fi
 
-    INSTALLED_VERSION=$(sing-box version 2>/dev/null | head -1 || echo "unknown")
+    tar -tzf "$archive_path" "${archive_dir}/sing-box" >/dev/null 2>&1 || {
+        err "发布包内未找到 sing-box 二进制"
+        exit 1
+    }
+    info "校验通过，正在流式解压二进制..."
+    tar -xzf "$archive_path" -C "$SINGBOX_TMP" "${archive_dir}/sing-box"
+
+    chmod 0755 "${SINGBOX_TMP}/${archive_dir}/sing-box"
+    "${SINGBOX_TMP}/${archive_dir}/sing-box" version | grep -F "sing-box version ${SINGBOX_VERSION}" >/dev/null || {
+        err "二进制版本验证失败"
+        exit 1
+    }
+
+    mkdir -p "$(dirname "$SINGBOX_BIN")"
+    SINGBOX_STAGE="${SINGBOX_BIN}.$$.new"
+    cp "${SINGBOX_TMP}/${archive_dir}/sing-box" "$SINGBOX_STAGE"
+    chmod 0755 "$SINGBOX_STAGE"
+    mv -f "$SINGBOX_STAGE" "$SINGBOX_BIN"
+    SINGBOX_STAGE=""
+
+    INSTALLED_VERSION=$($SINGBOX_BIN version 2>/dev/null | head -1 || echo "unknown")
     info "sing-box 安装成功: $INSTALLED_VERSION"
 }
 
@@ -185,8 +254,8 @@ generate_psk() {
         info "自动生成密码..."
         
         # 优先使用 sing-box
-        if command -v sing-box >/dev/null 2>&1; then
-            PSK=$(sing-box generate rand --base64 "$KEY_BYTES" 2>/dev/null | tr -d '\n\r' || true)
+        if [ -x "$SINGBOX_BIN" ]; then
+            PSK=$($SINGBOX_BIN generate rand --base64 "$KEY_BYTES" 2>/dev/null | tr -d '\n\r' || true)
         fi
         
         # 备选: openssl
@@ -245,8 +314,8 @@ create_config() {
 EOF
 
     # 验证配置
-    if command -v sing-box >/dev/null 2>&1; then
-        if sing-box check -c "$CONFIG_PATH" >/dev/null 2>&1; then
+    if [ -x "$SINGBOX_BIN" ]; then
+        if "$SINGBOX_BIN" check -c "$CONFIG_PATH" >/dev/null 2>&1; then
             info "配置文件验证通过"
         else
             warn "配置文件验证失败，但将继续..."
@@ -270,12 +339,14 @@ setup_service() {
 
 name="sing-box"
 description="Sing-box Proxy Server"
-command="/usr/bin/sing-box"
+command="/usr/local/bin/sing-box"
 command_args="run -c /etc/sing-box/config.json"
 pidfile="/run/${RC_SVCNAME}.pid"
 command_background="yes"
 output_log="/var/log/sing-box.log"
 error_log="/var/log/sing-box.err"
+export GOMEMLIMIT="32MiB"
+export GOGC="25"
 
 depend() {
     need net
@@ -333,8 +404,10 @@ Wants=network.target
 Type=simple
 User=root
 WorkingDirectory=/etc/sing-box
-ExecStart=/usr/bin/sing-box run -c /etc/sing-box/config.json
+ExecStart=/usr/local/bin/sing-box run -c /etc/sing-box/config.json
 ExecReload=/bin/kill -HUP $MAINPID
+Environment=GOMEMLIMIT=32MiB
+Environment=GOGC=25
 Restart=on-failure
 RestartSec=10s
 LimitNOFILE=1048576
