@@ -8,8 +8,9 @@ warn() { echo -e "\033[1;33m[WARN]\033[0m $*"; }
 err()  { echo -e "\033[1;31m[ERR]\033[0m $*" >&2; }
 
 # 固定官方版本与校验值，避免在低内存机器上调用包管理器或现场编译。
-SINGBOX_VERSION="1.14.2"
+SINGBOX_VERSION="1.13.12"
 SINGBOX_BIN="/usr/local/bin/sing-box"
+SINGBOX_BIN_SRC="${SINGBOX_BIN_SRC:-/root/sing-box}"
 SINGBOX_TMP=""
 SINGBOX_STAGE=""
 
@@ -145,7 +146,7 @@ get_config
 # -----------------------
 # 安装官方 sing-box musl 二进制
 install_singbox() {
-    local machine arch expected archive_name archive_url archive_dir archive_path actual existing_bin
+    local machine arch expected_archive expected_binary archive_name archive_url archive_dir archive_path actual existing_bin candidate memory_limit
 
     info "开始安装官方 sing-box v${SINGBOX_VERSION} musl 二进制..."
 
@@ -166,19 +167,23 @@ install_singbox() {
     case "$machine" in
         x86_64|amd64)
             arch="amd64"
-            expected="8f6cb4bcf94d2b33c65d52e0d5b142db29a938336f1ff7267f397ac3758fc297"
+            expected_archive="43258b1c8ae25c01f41135056a2b6fb464329ded344658a2a68a852113b7ea63"
+            expected_binary="2b41c625ef6e21bda71e435abab9c74e831e2fe81800f05322fa149737fa663e"
             ;;
         aarch64|arm64)
             arch="arm64"
-            expected="675297394f9430cebb72b3c48ba8bce0d6f7c750a9d68a8f7f88c515c8255cd1"
+            expected_archive="23b814f5416d379b9d67eef3605b45280376267b39517c35d20957eb1e53376b"
+            expected_binary="c524021b02327693631f4c054303da8f900b9d1858976a0213c7b8067cc6f736"
             ;;
         i386|i486|i586|i686)
             arch="386"
-            expected="e84faef6ccf47d9b7ffc071b1061b1dc8f38e747ce8f4d4543f200c2d1f6f845"
+            expected_archive="051974e725608d9cfebd6b0903aa6bded9e6df4fe0931fedc37bfae51a0f751f"
+            expected_binary="5852ac2370f5b4bb39bc1fc7ca5f343671c0be4ed207910d005a1b111743716c"
             ;;
         armv7|armv7l)
             arch="armv7"
-            expected="ba873d9e1eaff53dd6f678ecc315ac6fcb9d28b32b550e1ecc8227634955b56f"
+            expected_archive="b1699052ec047c5dee0474c8107e7dd9ebf69948e43e044ce132e836040b8cc2"
+            expected_binary="e6d8efb79e4e88a35b974ee42539a1a826317e802a4e3ec307765eb8fbbdbc14"
             ;;
         *)
             err "暂不支持此 CPU 架构: $machine"
@@ -194,48 +199,82 @@ install_singbox() {
         done < <(pgrep -x sshd 2>/dev/null || true)
     fi
 
-    # /tmp 在部分小内存 VPS 上是 tmpfs，使用 /var/tmp 避免压缩包占用 RAM。
-    SINGBOX_TMP=$(mktemp -d /var/tmp/singbox-musl.XXXXXX)
-    archive_name="sing-box-${SINGBOX_VERSION}-linux-${arch}-musl.tar.gz"
-    archive_url="https://github.com/SagerNet/sing-box/releases/download/v${SINGBOX_VERSION}/${archive_name}"
-    archive_dir="sing-box-${SINGBOX_VERSION}-linux-${arch}-musl"
-    archive_path="${SINGBOX_TMP}/${archive_name}"
+    if [ -f "$SINGBOX_BIN_SRC" ]; then
+        info "使用已上传的 musl 二进制: $SINGBOX_BIN_SRC"
+        actual=$(sha256sum "$SINGBOX_BIN_SRC" | awk '{print $1}')
+        [ "$actual" = "$expected_binary" ] || {
+            err "上传的二进制 SHA-256 不匹配，请确认版本和 CPU 架构"
+            exit 1
+        }
+        candidate="$SINGBOX_BIN_SRC"
+    else
+        memory_limit=""
+        if [ -r /sys/fs/cgroup/memory.max ]; then
+            memory_limit=$(cat /sys/fs/cgroup/memory.max)
+        elif [ -r /sys/fs/cgroup/memory/memory.limit_in_bytes ]; then
+            memory_limit=$(cat /sys/fs/cgroup/memory/memory.limit_in_bytes)
+        fi
+        case "$memory_limit" in
+            ''|max|*[!0-9]*) ;;
+            *)
+                if [ "$memory_limit" -le 100663296 ]; then
+                    err "检测到内存限制不超过 96 MiB，服务器端解压可能触发 OOM。"
+                    err "请先在本地解压 ${SINGBOX_VERSION} 的 ${arch} musl 包，并上传二进制到 $SINGBOX_BIN_SRC。"
+                    exit 1
+                fi
+                ;;
+        esac
 
-    info "下载 ${archive_name}..."
-    curl --fail --location --retry 3 --connect-timeout 15 \
-        --proto '=https' --tlsv1.2 \
-        --output "$archive_path" "$archive_url" || {
-        err "musl 二进制下载失败，请检查网络连接"
-        exit 1
-    }
+        # 内存充足时才允许服务器下载并解压官方发布包。
+        mkdir -p /var/tmp
+        SINGBOX_TMP=$(mktemp -d /var/tmp/singbox-musl.XXXXXX)
+        archive_name="sing-box-${SINGBOX_VERSION}-linux-${arch}-musl.tar.gz"
+        archive_url="https://github.com/SagerNet/sing-box/releases/download/v${SINGBOX_VERSION}/${archive_name}"
+        archive_dir="sing-box-${SINGBOX_VERSION}-linux-${arch}-musl"
+        archive_path="${SINGBOX_TMP}/${archive_name}"
 
-    actual=$(sha256sum "$archive_path" | awk '{print $1}')
-    if [ "$actual" != "$expected" ]; then
-        err "SHA-256 校验失败，已拒绝安装"
-        exit 1
+        info "下载 ${archive_name}..."
+        curl --fail --location --retry 3 --connect-timeout 15 \
+            --proto '=https' --tlsv1.2 \
+            --output "$archive_path" "$archive_url" || {
+            err "musl 二进制下载失败，请检查网络连接"
+            exit 1
+        }
+
+        actual=$(sha256sum "$archive_path" | awk '{print $1}')
+        [ "$actual" = "$expected_archive" ] || {
+            err "压缩包 SHA-256 校验失败，已拒绝安装"
+            exit 1
+        }
+
+        tar -tzf "$archive_path" "${archive_dir}/sing-box" >/dev/null 2>&1 || {
+            err "发布包内未找到 sing-box 二进制"
+            exit 1
+        }
+        info "校验通过，正在解压二进制..."
+        tar -xzf "$archive_path" -C "$SINGBOX_TMP" "${archive_dir}/sing-box"
+        candidate="${SINGBOX_TMP}/${archive_dir}/sing-box"
+        actual=$(sha256sum "$candidate" | awk '{print $1}')
+        [ "$actual" = "$expected_binary" ] || {
+            err "解压后的二进制 SHA-256 校验失败"
+            exit 1
+        }
     fi
 
-    tar -tzf "$archive_path" "${archive_dir}/sing-box" >/dev/null 2>&1 || {
-        err "发布包内未找到 sing-box 二进制"
-        exit 1
-    }
-    info "校验通过，正在流式解压二进制..."
-    tar -xzf "$archive_path" -C "$SINGBOX_TMP" "${archive_dir}/sing-box"
-
-    chmod 0755 "${SINGBOX_TMP}/${archive_dir}/sing-box"
-    "${SINGBOX_TMP}/${archive_dir}/sing-box" version | grep -F "sing-box version ${SINGBOX_VERSION}" >/dev/null || {
+    chmod 0755 "$candidate"
+    env GOMEMLIMIT=32MiB GOGC=25 "$candidate" version | grep -F "sing-box version ${SINGBOX_VERSION}" >/dev/null || {
         err "二进制版本验证失败"
         exit 1
     }
 
     mkdir -p "$(dirname "$SINGBOX_BIN")"
     SINGBOX_STAGE="${SINGBOX_BIN}.$$.new"
-    cp "${SINGBOX_TMP}/${archive_dir}/sing-box" "$SINGBOX_STAGE"
+    cp "$candidate" "$SINGBOX_STAGE"
     chmod 0755 "$SINGBOX_STAGE"
     mv -f "$SINGBOX_STAGE" "$SINGBOX_BIN"
     SINGBOX_STAGE=""
 
-    INSTALLED_VERSION=$($SINGBOX_BIN version 2>/dev/null | head -1 || echo "unknown")
+    INSTALLED_VERSION=$(env GOMEMLIMIT=32MiB GOGC=25 "$SINGBOX_BIN" version 2>/dev/null | head -1 || echo "unknown")
     info "sing-box 安装成功: $INSTALLED_VERSION"
 }
 
@@ -255,7 +294,7 @@ generate_psk() {
         
         # 优先使用 sing-box
         if [ -x "$SINGBOX_BIN" ]; then
-            PSK=$($SINGBOX_BIN generate rand --base64 "$KEY_BYTES" 2>/dev/null | tr -d '\n\r' || true)
+            PSK=$(env GOMEMLIMIT=32MiB GOGC=25 "$SINGBOX_BIN" generate rand --base64 "$KEY_BYTES" 2>/dev/null | tr -d '\n\r' || true)
         fi
         
         # 备选: openssl
@@ -315,7 +354,7 @@ EOF
 
     # 验证配置
     if [ -x "$SINGBOX_BIN" ]; then
-        if "$SINGBOX_BIN" check -c "$CONFIG_PATH" >/dev/null 2>&1; then
+        if env GOMEMLIMIT=32MiB GOGC=25 "$SINGBOX_BIN" check -c "$CONFIG_PATH" >/dev/null 2>&1; then
             info "配置文件验证通过"
         else
             warn "配置文件验证失败，但将继续..."
