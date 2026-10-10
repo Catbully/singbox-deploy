@@ -216,6 +216,32 @@ select_ss_method() {
 select_ss_method
 
 # -----------------------
+# 选择出入站网络配置
+select_network_mode() {
+    info "=== 是否改变出入站配置 ==="
+    echo "1) 不修改（默认）"
+    echo "2) IPv4 入站 / IPv4 出站"
+    echo "3) IPv6 入站 / IPv4 出站"
+    echo ""
+    echo "请输入选择(默认为 1):"
+    read -r network_mode_choice
+
+    case "${network_mode_choice:-1}" in
+        1) NETWORK_MODE=1 ;;
+        2) NETWORK_MODE=2 ;;
+        3) NETWORK_MODE=3 ;;
+        *)
+            warn "无效选择，使用默认配置（不修改）"
+            NETWORK_MODE=1
+            ;;
+    esac
+
+    export NETWORK_MODE
+}
+
+select_network_mode
+
+# -----------------------
 # 在获取公网 IP 之前，询问连接ip和sni配置
 echo ""
 echo "请输入节点连接 IP 或 DDNS域名(留空默认出口IP):"
@@ -691,6 +717,25 @@ CONFIG_TAIL
 
     rm -f "$TEMP_INBOUNDS"
 
+    case "${NETWORK_MODE:-1}" in
+        2)
+            jq '
+              .inbounds |= map(.listen = "0.0.0.0")
+              | .route = ((.route // {}) | .rules = ([{"action":"resolve","strategy":"ipv4_only"}] + (.rules // [])))
+            ' "$CONFIG_PATH" > "${CONFIG_PATH}.tmp" \
+              && mv "${CONFIG_PATH}.tmp" "$CONFIG_PATH" \
+              || { rm -f "${CONFIG_PATH}.tmp"; err "应用 IPv4 出入站配置失败"; exit 1; }
+            ;;
+        3)
+            jq '
+              .inbounds |= map(.listen = "::")
+              | .route = ((.route // {}) | .rules = ([{"action":"resolve","strategy":"ipv4_only"}] + (.rules // [])))
+            ' "$CONFIG_PATH" > "${CONFIG_PATH}.tmp" \
+              && mv "${CONFIG_PATH}.tmp" "$CONFIG_PATH" \
+              || { rm -f "${CONFIG_PATH}.tmp"; err "应用 IPv6 入站 / IPv4 出站配置失败"; exit 1; }
+            ;;
+    esac
+
     sing-box check -c "$CONFIG_PATH" >/dev/null 2>&1 \
        && info "配置文件验证通过" \
        || warn "配置文件验证失败,但继续执行"
@@ -702,6 +747,7 @@ ENABLE_HY2=$ENABLE_HY2
 ENABLE_TUIC=$ENABLE_TUIC
 ENABLE_REALITY=$ENABLE_REALITY
 ENABLE_ANYTLS=$ENABLE_ANYTLS
+NETWORK_MODE=${NETWORK_MODE:-1}
 CACHEEOF
 
     $ENABLE_SS && cat >> /etc/sing-box/.config_cache <<CACHEEOF
