@@ -348,7 +348,13 @@ get_config
 # -----------------------
 # 安装 sing-box
 install_singbox() {
-    info "开始安装 sing-box..."
+    local version="1.13.12"
+    local source_bin="${SINGBOX_BIN_SRC:-/root/sing-box}"
+    local target_bin="/usr/local/bin/sing-box"
+    local stage_bin="${target_bin}.$$.new"
+    local machine arch expected actual
+
+    info "开始安装 sing-box musl 二进制..."
 
     if command -v sing-box >/dev/null 2>&1; then
         CURRENT_VERSION=$(sing-box version 2>/dev/null | head -1 || echo "unknown")
@@ -360,33 +366,59 @@ install_singbox() {
         fi
     fi
 
-    case "$OS" in
-        alpine)
-            info "使用 Edge 仓库安装 sing-box"
-            apk update || { err "apk update 失败"; exit 1; }
-            apk add --repository=http://dl-cdn.alpinelinux.org/alpine/edge/community sing-box || {
-                err "sing-box 安装失败"
-                exit 1
-            }
+    machine=$(uname -m)
+    case "$machine" in
+        x86_64|amd64)
+            arch="amd64"
+            expected="2b41c625ef6e21bda71e435abab9c74e831e2fe81800f05322fa149737fa663e"
             ;;
-        debian|redhat)
-            bash <(curl -fsSL https://sing-box.app/install.sh) || {
-                err "sing-box 安装失败"
-                exit 1
-            }
+        aarch64|arm64)
+            arch="arm64"
+            expected="c524021b02327693631f4c054303da8f900b9d1858976a0213c7b8067cc6f736"
+            ;;
+        i386|i486|i586|i686)
+            arch="386"
+            expected="5852ac2370f5b4bb39bc1fc7ca5f343671c0be4ed207910d005a1b111743716c"
+            ;;
+        armv7|armv7l)
+            arch="armv7"
+            expected="e6d8efb79e4e88a35b974ee42539a1a826317e802a4e3ec307765eb8fbbdbc14"
             ;;
         *)
-            err "未支持的系统,无法安装 sing-box"
+            err "不支持的 CPU 架构: $machine"
             exit 1
             ;;
     esac
 
-    if ! command -v sing-box >/dev/null 2>&1; then
-        err "sing-box 安装后未找到可执行文件"
+    if [ ! -f "$source_bin" ]; then
+        err "未找到 sing-box musl 二进制: $source_bin"
+        err "请先在本地解压 sing-box-${version}-linux-${arch}-musl.tar.gz，并上传为 $source_bin"
         exit 1
     fi
 
-    INSTALLED_VERSION=$(sing-box version 2>/dev/null | head -1 || echo "unknown")
+    actual=$(sha256sum "$source_bin" | awk '{print $1}')
+    if [ "$actual" != "$expected" ]; then
+        err "二进制 SHA-256 校验失败，请确认版本和 CPU 架构"
+        exit 1
+    fi
+
+    export GOMEMLIMIT="${GOMEMLIMIT:-32MiB}"
+    export GOGC="${GOGC:-25}"
+
+    chmod 0755 "$source_bin"
+    "$source_bin" version | grep -F "sing-box version ${version}" >/dev/null || {
+        err "sing-box 二进制版本验证失败"
+        exit 1
+    }
+
+    mkdir -p /usr/local/bin
+    cp "$source_bin" "$stage_bin"
+    chmod 0755 "$stage_bin"
+    mv -f "$stage_bin" "$target_bin"
+    ln -sf "$target_bin" /usr/bin/sing-box
+    hash -r
+
+    INSTALLED_VERSION=$("$target_bin" version 2>/dev/null | head -1 || echo "unknown")
     info "sing-box 安装成功: $INSTALLED_VERSION"
 }
 
