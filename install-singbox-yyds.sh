@@ -378,7 +378,7 @@ install_singbox() {
     local source_bin="${SINGBOX_BIN_SRC:-/root/sing-box}"
     local target_bin="/usr/local/bin/sing-box"
     local stage_bin="${target_bin}.$$.new"
-    local machine arch expected actual
+    local machine arch expected actual version_output version_rc=0 service_manager=""
 
     info "开始安装 sing-box musl 二进制..."
 
@@ -428,14 +428,38 @@ install_singbox() {
         exit 1
     fi
 
+    if [ "$OS" = "alpine" ] && command -v rc-service >/dev/null 2>&1 \
+       && rc-service sing-box status >/dev/null 2>&1; then
+        info "停止现有 sing-box 服务，释放安装所需内存..."
+        rc-service sing-box stop >/dev/null || {
+            err "无法停止现有 sing-box 服务"
+            exit 1
+        }
+        service_manager="openrc"
+    elif command -v systemctl >/dev/null 2>&1 \
+         && systemctl is-active --quiet sing-box 2>/dev/null; then
+        info "停止现有 sing-box 服务，释放安装所需内存..."
+        systemctl stop sing-box || {
+            err "无法停止现有 sing-box 服务"
+            exit 1
+        }
+        service_manager="systemd"
+    fi
+
     export GOMEMLIMIT="${GOMEMLIMIT:-32MiB}"
     export GOGC="${GOGC:-25}"
 
     chmod 0755 "$source_bin"
-    "$source_bin" version | grep -F "sing-box version ${version}" >/dev/null || {
+    version_output=$("$source_bin" version 2>&1) || version_rc=$?
+    if [ "$version_rc" -ne 0 ] || [[ "$version_output" != *"sing-box version ${version}"* ]]; then
+        case "$service_manager" in
+            openrc) rc-service sing-box start >/dev/null 2>&1 || true ;;
+            systemd) systemctl start sing-box >/dev/null 2>&1 || true ;;
+        esac
         err "sing-box 二进制版本验证失败"
+        [ -n "$version_output" ] && err "验证输出: $version_output"
         exit 1
-    }
+    fi
 
     mkdir -p /usr/local/bin
     cp "$source_bin" "$stage_bin"
@@ -444,7 +468,7 @@ install_singbox() {
     ln -sf "$target_bin" /usr/bin/sing-box
     hash -r
 
-    INSTALLED_VERSION=$("$target_bin" version 2>/dev/null | head -1 || echo "unknown")
+    INSTALLED_VERSION="${version_output%%$'\n'*}"
     info "sing-box 安装成功: $INSTALLED_VERSION"
 }
 
