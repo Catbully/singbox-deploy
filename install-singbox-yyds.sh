@@ -379,15 +379,23 @@ install_singbox() {
     local target_bin="/usr/local/bin/sing-box"
     local stage_bin="${target_bin}.$$.new"
     local machine arch expected actual version_output version_rc=0 service_manager=""
+    local download_url="" archive_member="" binary_size="" install_bin="$source_bin" stage_ready=false
+
+    restore_singbox_service() {
+        case "$service_manager" in
+            openrc) rc-service sing-box start >/dev/null 2>&1 || true ;;
+            systemd) systemctl start sing-box >/dev/null 2>&1 || true ;;
+        esac
+    }
 
     info "开始安装 sing-box musl 二进制..."
 
     if command -v sing-box >/dev/null 2>&1; then
-        CURRENT_VERSION=$(sing-box version 2>/dev/null | head -1 || echo "unknown")
-        warn "检测到已安装 sing-box: $CURRENT_VERSION"
+        warn "检测到已安装 sing-box: $(command -v sing-box)"
         read -p "是否重新安装?(y/N): " REINSTALL
         if [[ ! "$REINSTALL" =~ ^[Yy]$ ]]; then
             info "跳过 sing-box 安装"
+            unset -f restore_singbox_service
             return 0
         fi
     fi
@@ -412,21 +420,10 @@ install_singbox() {
             ;;
         *)
             err "不支持的 CPU 架构: $machine"
+            unset -f restore_singbox_service
             exit 1
             ;;
     esac
-
-    if [ ! -f "$source_bin" ]; then
-        err "未找到 sing-box musl 二进制: $source_bin"
-        err "请先在本地解压 sing-box-${version}-linux-${arch}-musl.tar.gz，并上传为 $source_bin"
-        exit 1
-    fi
-
-    actual=$(sha256sum "$source_bin" | awk '{print $1}')
-    if [ "$actual" != "$expected" ]; then
-        err "二进制 SHA-256 校验失败，请确认版本和 CPU 架构"
-        exit 1
-    fi
 
     if [ "$OS" = "alpine" ] && command -v rc-service >/dev/null 2>&1 \
        && rc-service sing-box status >/dev/null 2>&1; then
@@ -446,27 +443,73 @@ install_singbox() {
         service_manager="systemd"
     fi
 
+    mkdir -p /usr/local/bin
+
+    if [ ! -f "$source_bin" ]; then
+        download_url="https://github.com/SagerNet/sing-box/releases/download/v${version}/sing-box-${version}-linux-${arch}-musl.tar.gz"
+        archive_member="sing-box-${version}-linux-${arch}-musl/sing-box"
+        info "未找到本地二进制，正在流式下载官方 sing-box ${version} musl (${arch})..."
+
+        if ! binary_size=$(curl -fsSL --retry 3 --connect-timeout 10 "$download_url" \
+             | tar -tzvf - "$archive_member" 2>/dev/null \
+             | awk 'NR == 1 {print $3}'); then
+            restore_singbox_service
+            err "无法读取 sing-box 下载包信息: $download_url"
+            exit 1
+        fi
+        if [[ ! "$binary_size" =~ ^[0-9]+$ ]] || [ "$binary_size" -le 0 ]; then
+            restore_singbox_service
+            err "sing-box 二进制大小无效: ${binary_size:-unknown}"
+            exit 1
+        fi
+
+        if ! curl -fsSL --retry 3 --connect-timeout 10 "$download_url" \
+             | tar -xzO -f - "$archive_member" \
+             | dd of="$stage_bin" bs=4K iflag=fullblock oflag=direct conv=sync 2>/dev/null; then
+            rm -f "$stage_bin"
+            restore_singbox_service
+            err "下载或解压 sing-box musl 失败: $download_url"
+            exit 1
+        fi
+        truncate -s "$binary_size" "$stage_bin"
+        sync
+        install_bin="$stage_bin"
+        stage_ready=true
+    fi
+
+    actual=$(sha256sum "$install_bin" | awk '{print $1}')
+    if [ "$actual" != "$expected" ]; then
+        $stage_ready && rm -f "$stage_bin"
+        restore_singbox_service
+        err "二进制 SHA-256 校验失败，请确认版本和 CPU 架构"
+        exit 1
+    fi
+
     export GOMEMLIMIT="${GOMEMLIMIT:-32MiB}"
     export GOGC="${GOGC:-25}"
 
-    chmod 0755 "$source_bin"
-    version_output=$("$source_bin" version 2>&1) || version_rc=$?
+    chmod 0755 "$install_bin"
+    version_output=$("$install_bin" version 2>&1) || version_rc=$?
     if [ "$version_rc" -ne 0 ] || [[ "$version_output" != *"sing-box version ${version}"* ]]; then
         case "$service_manager" in
             openrc) rc-service sing-box start >/dev/null 2>&1 || true ;;
             systemd) systemctl start sing-box >/dev/null 2>&1 || true ;;
         esac
+        $stage_ready && rm -f "$stage_bin"
         err "sing-box 二进制版本验证失败"
         [ -n "$version_output" ] && err "验证输出: $version_output"
         exit 1
     fi
 
-    mkdir -p /usr/local/bin
-    cp "$source_bin" "$stage_bin"
-    chmod 0755 "$stage_bin"
+    if ! $stage_ready; then
+        cp "$install_bin" "$stage_bin"
+        chmod 0755 "$stage_bin"
+    fi
     mv -f "$stage_bin" "$target_bin"
     ln -sf "$target_bin" /usr/bin/sing-box
     hash -r
+
+    unset -f restore_singbox_service
 
     INSTALLED_VERSION="${version_output%%$'\n'*}"
     info "sing-box 安装成功: $INSTALLED_VERSION"
